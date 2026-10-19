@@ -1,0 +1,949 @@
+SCL (Sound Creator Library)
+User Manual
+Version 21.0.0
+
+======================================================================
+1. OVERVIEW
+======================================================================
+
+SCL (Sound Creator Library) is an RGBDS assembly sound library for the
+Nintendo Game Boy sound hardware. It provides:
+
+- Four-channel music playback (two pulse channels, one wave channel,
+  and one noise channel).
+- Song, pattern, track, note, rest, and tempo definitions through RGBASM
+  macros.
+- Instrument definitions with pulse duty, envelope, sweep, noise, wave
+  RAM, effects, volume, panning, and priority fields.
+- Per-note volume, gate/staccato, and envelope velocity control.
+- Per-instrument panning through NR51.
+- Channel 3 waveform banks and automatic wave RAM switching.
+- Continuous effects such as arpeggio, slide, vibrato, and tremolo.
+- Runtime tempo changes.
+- Direct one-shot playback macros for notes and percussion.
+- A simple active-voice bitmask for debugging or VU-meter displays.
+
+This library was originally designed for modern RGBDS projects. The
+source file identifies RGBDS 0.9.2 as the version used for validation;
+the built-in version check accepts RGBDS 0.5.0 or newer.
+
+SCL directly uses the Game Boy APU registers. It is intended to be
+included in a Game Boy ROM project assembled with RGBASM and linked with
+RGBLINK.
+
+
+======================================================================
+2. INCLUDING THE LIBRARY
+======================================================================
+
+Include SCL.inc from an RGBASM source file:
+
+    INCLUDE "SCL.inc"
+
+SCL uses an include guard, so including it more than once does not
+redefine the library. The file declares its own WRAM section, ROM code
+section, ROM data section, hardware constants, macros, engine routines,
+and default instruments.
+
+The library requires the following normal Game Boy/RGBDS environment:
+
+- RGBASM/RGBLINK.
+- A valid Game Boy memory map and hardware register definitions.
+- Interrupts or a main loop capable of calling SCL_Update once per video
+  frame when music playback is active.
+
+If the project already defines any of the standard hardware symbols used
+by SCL, SCL keeps the existing definitions. Otherwise it defines them
+itself.
+
+
+======================================================================
+3. BASIC INITIALIZATION AND PLAYBACK
+======================================================================
+
+A minimal setup is:
+
+    INCLUDE "SCL.inc"
+
+    ; Once during program initialization:
+    SCL_INIT
+
+    ; Define or include a song, then start it:
+    ld hl, MySong
+    call SCL_PlaySong
+
+    ; Call once per frame while the game is running:
+    call SCL_Update
+
+SCL_INIT enables the APU, routes all four channels to both speakers,
+sets the master volume to maximum, clears SCL state, clears the waveform
+buffer, initializes the pseudo-random seed, and sets the default CPU
+priority to 2.
+
+SCL_PlaySong expects HL to contain the address of a song label created by
+BEGIN_SONG. It starts the song at its first pattern. Songs loop when the
+end of their pattern list is reached.
+
+SCL_Update should normally be called once per frame. It advances note
+processing, channel durations, continuous effects, and pattern playback.
+It is safe to call it when no song is active.
+
+The library's SCL_WaitFrame routine waits for the next Game Boy VBlank,
+so a program that uses SCL_Update from a frame loop should avoid creating
+an additional conflicting frame-timing system.
+
+
+======================================================================
+4. SONGS, PATTERNS, TRACKS, AND NOTES
+======================================================================
+
+4.1 Songs
+----------
+
+Define a song with BEGIN_SONG, add patterns with ADD_PATTERN, and finish
+with END_SONG:
+
+    BEGIN_SONG MySong, 6, 120
+        ADD_PATTERN Pattern_A
+        ADD_PATTERN Pattern_B
+    END_SONG
+
+Arguments:
+
+    BEGIN_SONG name, ticks_per_line, bpm
+
+- name: Song label.
+- ticks_per_line: Initial live tempo value. This is the number of
+  SCL_Update calls between event advances.
+- bpm: Informational only. SCL stores it but the playback engine does
+  not use it to calculate timing.
+
+END_SONG writes $FFFF as the pattern-list terminator. At the terminator,
+SCL loops back to the first pattern.
+
+4.2 Patterns
+------------
+
+A pattern contains a list of tracks. Each track is associated with one
+hardware channel:
+
+    BEGIN_PATTERN Pattern_A, 16
+        ADD_TRACK 1, Melody_A
+        ADD_TRACK 2, Bass_A
+        ADD_TRACK 4, Drums_A
+    END_PATTERN
+
+Arguments:
+
+    BEGIN_PATTERN name, line_count
+
+- name: Pattern label.
+- line_count: Informational pattern length. The engine does not use this
+  value to advance playback; event durations and the conductor track
+  determine progression.
+
+    ADD_TRACK channel, track_label
+
+- channel: 1, 2, 3, or 4.
+- track_label: Label created with BEGIN_TRACK.
+
+A pattern may use any subset of the four channels. The first track listed
+with ADD_TRACK becomes the conductor track. When that track reaches
+END_TRACK, SCL loads the next pattern. A track that is not present in the
+current pattern is silenced when the pattern is loaded.
+
+4.3 Tracks
+----------
+
+Create a track with BEGIN_TRACK and close it with END_TRACK:
+
+    BEGIN_TRACK Melody_A
+        NOTE C3, 6, Piano
+        NOTE E3, 6, Piano
+        NOTE G3, 12, Piano
+        REST 6
+        END_TRACK
+
+A track is a sequential list of events. It is not necessary for all
+tracks in a pattern to contain the same number of events. The conductor
+track controls when the next pattern is loaded.
+
+4.4 Notes
+---------
+
+    NOTE note, duration, instrument
+    NOTE note, duration, instrument, volume
+    NOTE note, duration, instrument, volume, gate
+    NOTE note, duration, instrument, volume, gate, velocity
+
+Arguments:
+
+- note: A note constant such as C2, F3, or C4s.
+- duration: Event duration in SCL timing units.
+- instrument: An instrument label created with DEF_INSTRUMENT.
+- volume: 0-15, default 15. This is the starting volume of the note.
+- gate: Number of timing units removed from the end of the event,
+  default 0. A value of 0 plays for the full event duration. A positive
+  value creates a shorter note/staccato effect. The effective duration is
+  always at least one timing unit.
+- velocity: 0-15, default 0. This is not note loudness. A non-zero value
+  overrides the envelope decay speed. Higher values make the sound decay
+  more slowly after its attack. Internally, the value is reduced to the
+  three bits supported by the APU envelope register.
+
+Example:
+
+    NOTE C3, 8, Piano, 12, 2, 4
+
+This starts C3 at volume 12, shortens its effective sounding time by two
+units, and overrides the envelope decay speed with velocity 4.
+
+4.5 Rests
+---------
+
+    REST duration
+
+REST advances the track without starting a sound. It uses the special
+SCL_NOTE_REST sentinel ($FFFE), because the valid period range includes
+zero as the highest supported pitch.
+
+4.6 Track termination
+---------------------
+
+    END_TRACK
+
+END_TRACK writes the SCL_NOTE_END sentinel ($FFFF). When the conductor
+track reaches it, SCL advances to the next pattern. When a non-conductor
+track reaches it, that track is stopped until the next pattern is loaded.
+
+
+======================================================================
+5. NOTE CONSTANTS
+======================================================================
+
+SCL defines Game Boy frequency-period constants from C0 through D4s:
+
+    C0 C0s D0 D0s E0 F0 F0s G0 G0s A0 A0s B0
+    C1 C1s D1 D1s E1 F1 F1s G1 G1s A1 A1s B1
+    C2 C2s D2 D2s E2 F2 F2s G2 G2s A2 A2s B2
+    C3 C3s D3 D3s E3 F3 F3s G3 G3s A3 A3s B3
+    C4 C4s D4 D4s
+
+The suffix s means sharp. For example, C2s is C sharp in octave 2.
+
+These constants are 11-bit APU periods, not linear frequency numbers:
+smaller periods produce higher pitches. The highest representable pitch in
+this table is D4s, whose period is $000. There is no octave 5 in this
+scheme because the hardware period cannot become negative.
+
+SCL_NOTE_REST is $FFFE and SCL_NOTE_END is $FFFF. These values are
+outside the valid 11-bit period range and are reserved for event control.
+
+
+======================================================================
+6. INSTRUMENTS
+======================================================================
+
+6.1 Defining an instrument
+--------------------------
+
+    DEF_INSTRUMENT name, duty, envelope, sweep, length
+    DEF_INSTRUMENT name, duty, envelope, sweep, length, effect, effect_param
+    DEF_INSTRUMENT name, duty, envelope, sweep, length, effect, effect_param, noise
+    DEF_INSTRUMENT name, duty, envelope, sweep, length, effect, effect_param, noise, waveform
+
+Arguments:
+
+- name: Instrument label.
+- duty: Pulse duty selection, normally 0-3. The macro stores it in the
+  two high bits used by NR11/NR21.
+- envelope: Initial APU envelope byte. The low nibble is replaced by the
+  note volume when a note is played; the high nibble supplies the envelope
+  direction and initial envelope settings.
+- sweep: Channel 1 sweep register value. It affects channel 1; other
+  channels ignore it.
+- length: APU length value, masked to 0-63.
+- effect: Continuous effect ID. Defaults to SCL_EFFECT_NONE.
+- effect_param: Effect parameter. Defaults to 0.
+- noise: NR43 configuration for channel 4. Combine a noise period with a
+  noise step setting. Defaults to 0.
+- waveform: Address of a waveform created by DEF_WAVEFORM or one of its
+  convenience variants. Used by channel 3. Defaults to 0, meaning that
+  the currently loaded wave RAM is kept.
+
+DEF_INSTRUMENT also initializes the instrument's reserved runtime fields
+with the values 15, 2, and 1. The instrument structure occupies 12 bytes.
+
+Example:
+
+    DEF_INSTRUMENT SoftLead, %10, $F2, 0, 0, SCL_EFFECT_VIBRATO, 4
+
+The default instruments supplied by SCL are:
+
+- Piano
+- Guitar
+- Bass
+- Flute
+- Synth
+- DrumKick
+- DrumSnare
+- DrumHat
+- DrumCymbal
+- WaveOrgan
+- WaveLead
+- WaveBuzz
+
+6.2 Instrument fields
+---------------------
+
+The following offsets are available when directly inspecting or building
+instrument data:
+
+    SCL_Instrument_duty
+    SCL_Instrument_env
+    SCL_Instrument_sweep
+    SCL_Instrument_length
+    SCL_Instrument_waveform
+    SCL_Instrument_noise
+    SCL_Instrument_effect
+    SCL_Instrument_effect_param
+    SCL_Instrument_volume
+    SCL_Instrument_pan
+    SCL_Instrument_priority
+    SCL_Instrument_SIZE
+
+The automatically created default instruments have volume 15, pan 2, and
+priority 1 in their corresponding fields. The pan field uses the SCL pan
+constants described in Section 8.
+
+
+======================================================================
+7. WAVEFORMS AND CHANNEL 3
+======================================================================
+
+7.1 Custom waveforms
+--------------------
+
+The Game Boy wave channel uses exactly 16 bytes of wave RAM. Define a
+custom waveform with:
+
+    DEF_WAVEFORM MyWave, byte0, byte1, byte2, byte3, byte4, byte5, byte6, byte7, byte8, byte9, byte10, byte11, byte12, byte13, byte14, byte15
+
+Each byte contains two 4-bit samples, matching the raw format of the
+Game Boy wave RAM.
+
+If the 16 byte arguments are omitted, DEF_WAVEFORM creates the default
+triangular waveform:
+
+    DEF_WAVEFORM WarmWave
+
+Convenience waveform macros are also available:
+
+    DEF_WAVEFORM_SAWTOOTH BrightWave
+    DEF_WAVEFORM_SQUARE   BuzzyWave
+
+7.2 Automatic waveform switching
+--------------------------------
+
+Associate a waveform with a channel 3 instrument:
+
+    DEF_INSTRUMENT Lead, %00, 0, 0, 0, SCL_EFFECT_NONE, 0, 0, BrightWave
+
+When that instrument is played on channel 3, SCL copies its waveform to
+wave RAM if it is different from the currently loaded waveform. SCL
+avoids reloading the same waveform repeatedly.
+
+If an instrument has no waveform pointer, it leaves the current wave RAM
+contents unchanged. This allows manual loading or shared waveform use.
+
+7.3 Manually loading wave RAM
+-----------------------------
+
+    SCL_LOAD_WAVEFORM WaveAddress
+
+This macro loads HL with the waveform address, DE with rWavePattern, BC
+with 16, and calls SCL_CopyWaveform. SCL_CopyWaveform temporarily turns
+off the channel 3 DAC during the copy and enables it again afterward.
+
+
+======================================================================
+8. EFFECTS, PANNING, AND TEMPO
+======================================================================
+
+8.1 Effect constants
+--------------------
+
+Continuous effects have IDs from 0 through 15:
+
+    SCL_EFFECT_NONE
+    SCL_EFFECT_ARPEGGIO
+    SCL_EFFECT_SLIDE
+    SCL_EFFECT_VIBRATO
+    SCL_EFFECT_TREMOLO
+    SCL_EFFECT_PORTA
+    SCL_EFFECT_ECHO
+    SCL_EFFECT_CHORUS
+    SCL_EFFECT_REVERB
+    SCL_EFFECT_FLANGER
+    SCL_EFFECT_PITCH_BEND
+    SCL_EFFECT_VOLUME_SWELL
+    SCL_EFFECT_PAN_SWEEP
+    SCL_EFFECT_RANDOM
+    SCL_EFFECT_GLIDE
+    SCL_EFFECT_FILTER
+
+In the current engine implementation, the active continuous processing
+code implements ARPEGGIO, SLIDE, VIBRATO, and TREMOLO. The other names are
+reserved effect IDs and do not currently perform an effect in
+SCL_ApplyEffect.
+
+Effects are read from the instrument and processed while the channel is
+active. They are applied during SCL_Update.
+
+8.2 Arpeggio
+------------
+
+For SCL_EFFECT_ARPEGGIO, effect_param uses two 4-bit semitone offsets:
+
+- High nibble: second arpeggio step.
+- Low nibble: third arpeggio step.
+
+The three phases are root note, root plus the high-nibble offset, and root
+plus the low-nibble offset. For example:
+
+    DEF_INSTRUMENT MajorArp, %10, $F2, 0, 0, SCL_EFFECT_ARPEGGIO, $47
+
+plays root, root + 4 semitones, and root + 7 semitones. SCL uses its
+musical note table rather than adding a raw value to the APU period.
+
+8.3 Slide
+---------
+
+SCL_EFFECT_SLIDE moves the current period toward a destination period.
+The destination and speed are maintained in channel state. The effect is
+primarily an engine-level feature; direct song authoring does not expose a
+separate NOTE parameter for the destination. It can be controlled by
+calling the low-level routines or by extending the event/instrument data.
+
+8.4 Vibrato
+-----------
+
+SCL_EFFECT_VIBRATO advances a per-channel phase by effect_param and
+applies a signed periodic pitch offset to the current note.
+
+8.5 Tremolo
+-----------
+
+SCL_EFFECT_TREMOLO advances a per-channel phase by effect_param and
+modulates the channel volume. The result is converted to the supported
+volume range for the channel.
+
+8.6 Runtime tempo changes
+-------------------------
+
+Use SET_TEMPO in one track, normally the conductor track:
+
+    BEGIN_TRACK Melody_A
+        NOTE C3, 6, Piano
+        SET_TEMPO 3
+        NOTE E3, 6, Piano
+        END_TRACK
+
+SET_TEMPO changes the live ticks-per-line value from that point onward.
+The event is a control command and does not start a note. Only one track
+should normally contain a given tempo command to avoid conflicting
+changes.
+
+The tempo value is stored in wSCL_CurrentTempo. The BPM value in
+BEGIN_SONG is informational and is not used by the engine.
+
+8.7 Panning constants
+---------------------
+
+    SCL_PAN_LEFT   = 0
+    SCL_PAN_RIGHT  = 1
+    SCL_PAN_MUTE   = 2
+    SCL_PAN_CENTER = 3
+
+The instrument pan field is applied automatically whenever SCL_PlayNote
+starts a note. Panning is implemented per channel using the two NR51 bits
+belonging to that channel.
+
+The SCL_SetChannelPan routine is a fast global control. Its input is B:
+
+- B = 0: all channels left.
+- B = 1: all channels right.
+- B = 3: all channels centered.
+- Any other value: all channels routed to both sides.
+
+SCL_SetChannelPan is different from instrument panning: it changes all
+channels at once and does not preserve individual instrument pan choices.
+
+
+======================================================================
+9. DIRECT PLAYBACK MACROS
+======================================================================
+
+These macros are useful for sound effects or simple blocking playback
+outside the song sequencer. They start a hardware sound, wait for a
+number of VBlank frames, and then stop or silence the sound.
+
+    PLAY_NOTE_CH1 period, duration
+    PLAY_NOTE_CH2 period, duration
+    PLAY_NOTE_CH3 period, duration
+    PLAY_NOISE noise_config, duration, envelope
+
+Examples:
+
+    PLAY_NOTE_CH1 C3, 8
+    PLAY_NOTE_CH2 G2, 4
+    PLAY_NOTE_CH3 C2, 12
+    PLAY_NOISE NOISE_PERIOD_7 | NOISE_STEP_7BIT, 3, $F8
+
+These macros call SCL_WaitTicks, so they block the CPU while waiting.
+They are not intended to be used simultaneously with time-critical
+logic unless that behavior is acceptable.
+
+For common percussion sounds:
+
+    PLAY_NOISE_DRUM KICK, 4
+    PLAY_NOISE_DRUM SNARE, 4
+    PLAY_NOISE_DRUM HAT, 2
+    PLAY_NOISE_DRUM CYMBAL, 8
+    PLAY_NOISE_DRUM TOM, 6
+
+Supported names are KICK, SNARE, HAT, CYMBAL, and TOM. The macro selects
+an appropriate NR43 value and envelope automatically.
+
+Noise constants:
+
+    NOISE_PERIOD_0 through NOISE_PERIOD_15
+    NOISE_STEP_7BIT
+    NOISE_STEP_15BIT
+
+Combine a period constant with one step constant using the bitwise OR
+operator.
+
+
+======================================================================
+10. MASTER AND CHANNEL CONTROLS
+======================================================================
+
+10.1 Master volume
+------------------
+
+    SCL_SET_MASTER_VOLUME left_volume, right_volume
+
+Both values are written as 4-bit values to NR50. The left value occupies
+the low nibble and the right value occupies the high nibble in the macro's
+assembled byte:
+
+    SCL_SET_MASTER_VOLUME 7, 7
+
+The resulting NR50 value is $77. The value is also saved in
+wSCL_MasterVolume.
+
+10.2 Master panning
+-------------------
+
+    SCL_SET_MASTER_PAN nr51_value
+
+This writes the supplied value directly to NR51 and saves it in
+wSCL_MasterPan. For broad routing, $FF sends every channel to both
+speakers.
+
+10.3 One channel's volume
+-------------------------
+
+    SCL_SET_CHANNEL_VOLUME channel, volume
+
+- channel: 1-4.
+- volume: 0-15.
+
+The routine updates SCL's channel volume state and the appropriate APU
+register. Channel 3 only supports the Game Boy wave-channel levels
+mute, 25%, 50%, and 100%; SCL converts the 0-15 value to the nearest
+supported level.
+
+10.4 CPU priority
+-----------------
+
+    SCL_SET_CPU_PRIORITY priority
+
+This stores a value in wSCL_CPUPriority. The field is available for
+project-specific scheduling or debugging. The current playback routines
+do not use it to automatically change scheduling behavior.
+
+10.5 Interrupt helpers
+----------------------
+
+    SCL_ENABLE_INTERRUPTS
+    SCL_DISABLE_INTERRUPTS
+
+SCL_ENABLE_INTERRUPTS enables the VBlank interrupt bit in IE and executes
+ei. SCL_DISABLE_INTERRUPTS executes di and clears IE. Use these macros
+only if your program's interrupt policy matches this behavior, since they
+modify the global interrupt enable state.
+
+
+======================================================================
+11. PUBLIC ROUTINES
+======================================================================
+
+The following routines are available as callable labels.
+
+SCL_INIT (macro)
+    Performs initial APU and SCL state initialization. Use the macro,
+    not call SCL_INIT; it expands directly to initialization code.
+
+SCL_PlaySong
+    Input: HL = address of a song label.
+    Starts the song and loads its first pattern.
+
+SCL_Update
+    Input: none.
+    Updates the sequencer and all four channels. Call once per frame.
+
+SCL_AdvancePattern
+    Input: internal pattern-list state.
+    Loads the next pattern. Loops to the beginning at END_SONG.
+
+SCL_LoadPattern
+    Input: DE = address of a pattern.
+    Associates its track list with channels and silences old channel
+    state.
+
+SCL_ProcessNextEventForChannel
+    Input: A = channel number, 1-4.
+    Reads and starts the next event in that channel's current track.
+
+SCL_ProcessChannel
+    Input: A = channel number, 1-4.
+    Decrements the current note duration and applies active effects.
+
+SCL_StopChannel
+    Input: A = channel number, 1-4.
+    Stops the channel and clears its hardware volume/DAC register.
+
+SCL_PlayNote
+    Input: A = channel number, 1-4; BC = note period or SCL_NOTE_REST;
+    DE = instrument address. Uses the current event state in the SCL
+    working variables. Normally called by the sequencer.
+
+SCL_UpdateNote
+    Input: A = channel number, 1-4; DE = new 11-bit note period.
+    Updates the channel state and the corresponding pitch registers.
+
+SCL_UpdateVolume
+    Input: A = channel number, 1-4; B = volume 0-15.
+    Updates the channel state and hardware volume.
+
+SCL_ApplyEffect
+    Input: A = channel number; B = effect ID; C = effect parameter;
+    DE = current period.
+    Applies a supported effect step.
+
+SCL_ApplyChannelPan
+    Input: A = zero-based channel index 0-3; B = SCL_PAN_* value.
+    Changes only that channel's two NR51 routing bits.
+
+SCL_SetChannelPan
+    Input: B = global pan selection (0 left, 1 right, 3 center, other
+    values both sides).
+    Changes the routing of all channels.
+
+SCL_CopyWaveform
+    Input: HL = source address; DE = destination address; BC = byte count.
+    Copies waveform data, disabling channel 3 during the operation.
+
+SCL_WaitFrame
+    Waits for the next VBlank period.
+
+SCL_WaitTicks
+    Input: A = number of frames.
+    Calls SCL_WaitFrame repeatedly. Preserves AF and BC.
+
+SCL_ClearMemory
+    Input: HL = destination; BC = number of bytes.
+    Fills the destination range with zeroes.
+
+SCL_GetActiveVoices
+    Output: A = active-channel bitmask. Bit 0 is channel 1, bit 1 is
+    channel 2, bit 2 is channel 3, and bit 3 is channel 4.
+
+SCL_Random
+    Output: updates the 16-bit pseudo-random seed. The generated value
+    is stored in wSCL_RandomSeed. The routine itself is useful as a
+    random-step source for project code.
+
+SCL_FindNoteIndex
+    Input: DE = period.
+    Output: A = index in SCL_NoteTable, or $FF if not found.
+
+SCL_NoteFromIndex
+    Input: A = note-table index.
+    Output: DE = period at that index.
+
+
+======================================================================
+12. RAM STATE AND STRUCTURE OFFSETS
+======================================================================
+
+SCL reserves its own WRAM variables in the "SCL Variables" section. The
+main state variables include:
+
+- wSCL_SongPtr: current song pointer; zero means no song.
+- wSCL_PatternPtr: current pattern pointer.
+- wSCL_PatternListPos: current position in the song pattern list.
+- wSCL_ConductorChannel: first track's channel in the current pattern.
+- wSCL_CurrentTempo: live ticks-per-line value.
+- wSCL_TempoCounter: tempo counter.
+- wSCL_EventDuration: duration of the event currently being processed.
+- wSCL_CurrentEffect and wSCL_CurrentEffectParam: current event effect.
+- wSCL_TrackVolume, wSCL_TrackPan, wSCL_ChannelGate, and
+  wSCL_ChannelVelocity: current event controls.
+- wSCL_MasterVolume and wSCL_MasterPan: last global routing values.
+- wSCL_RandomSeed: 16-bit pseudo-random state.
+- wSCL_CurrentWaveform: waveform currently loaded in wave RAM.
+- wSCL_WaveformBuffer: 16-byte waveform workspace.
+
+Per-channel arrays reserve two bytes per logical channel, even for fields
+that use only one byte. The channel stride is therefore two bytes. The
+arrays include active state, duration, instrument pointer, current note,
+root note, volume, arpeggio phase, slide destination and speed, vibrato
+phase, tremolo phase, and track event pointer.
+
+Use the labels wSCL_ChannelVars_START and wSCL_ChannelVars_END if a project
+needs to determine the reserved size of the per-channel state block.
+
+Song and pattern structure offsets are available as:
+
+    SCL_Song_tempo
+    SCL_Song_patterns
+    SCL_Song_bpm
+    SCL_Song_SIZE
+
+    SCL_Pattern_length
+    SCL_Pattern_tracks
+    SCL_Pattern_SIZE
+
+Event structure offsets are available as:
+
+    SCL_Event_note
+    SCL_Event_duration
+    SCL_Event_instrument
+    SCL_Event_effect
+    SCL_Event_effect_param
+    SCL_Event_volume
+    SCL_Event_pan
+    SCL_Event_gate
+    SCL_Event_velocity
+    SCL_Event_SIZE
+
+
+======================================================================
+13. COMPLETE EXAMPLE
+======================================================================
+
+The following example shows a small looping song with three channels and
+one noise track:
+
+    INCLUDE "SCL.inc"
+
+    ; The library's default instruments may be used directly.
+
+MyMelody:
+    BEGIN_SONG MyMelody, 6, 120
+        ADD_PATTERN Verse
+        ADD_PATTERN Chorus
+    END_SONG
+
+Verse:
+    BEGIN_PATTERN Verse, 16
+        ADD_TRACK 1, VerseLead
+        ADD_TRACK 2, VerseBass
+        ADD_TRACK 4, VerseDrums
+    END_PATTERN
+
+VerseLead:
+    BEGIN_TRACK VerseLead
+        NOTE C3, 6, Piano, 15, 1
+        NOTE E3, 6, Piano, 15, 1
+        NOTE G3, 6, Piano, 15, 1
+        NOTE C4, 6, Piano, 12, 2
+        END_TRACK
+
+VerseBass:
+    BEGIN_TRACK VerseBass
+        NOTE C1, 12, Bass
+        REST 6
+        NOTE G0, 6, Bass
+        END_TRACK
+
+VerseDrums:
+    BEGIN_TRACK VerseDrums
+        NOTE C4, 3, DrumKick
+        REST 3
+        NOTE C4, 3, DrumSnare
+        REST 3
+        NOTE C4, 3, DrumKick
+        REST 3
+        NOTE C4, 3, DrumSnare
+        END_TRACK
+
+Chorus:
+    BEGIN_PATTERN Chorus, 16
+        ADD_TRACK 1, ChorusLead
+        ADD_TRACK 2, ChorusBass
+        ADD_TRACK 3, ChorusWave
+        ADD_TRACK 4, ChorusDrums
+    END_PATTERN
+
+ChorusLead:
+    BEGIN_TRACK ChorusLead
+        NOTE C3, 6, Synth
+        NOTE G3, 6, Synth
+        NOTE C4, 12, Synth, 15, 3
+        END_TRACK
+
+ChorusBass:
+    BEGIN_TRACK ChorusBass
+        NOTE C1, 12, Bass
+        NOTE E1, 12, Bass
+        END_TRACK
+
+ChorusWave:
+    BEGIN_TRACK ChorusWave
+        NOTE C2, 12, WaveOrgan
+        NOTE G2, 12, WaveLead
+        END_TRACK
+
+ChorusDrums:
+    BEGIN_TRACK ChorusDrums
+        NOTE C4, 3, DrumKick
+        NOTE C4, 3, DrumHat
+        NOTE C4, 3, DrumSnare
+        NOTE C4, 3, DrumHat
+        END_TRACK
+
+; During initialization:
+    SCL_INIT
+    ld hl, MyMelody
+    call SCL_PlaySong
+
+; Once per frame:
+    call SCL_Update
+
+
+======================================================================
+14. IMPORTANT TIMING AND HARDWARE NOTES
+======================================================================
+
+1. Call SCL_Update regularly. The sequencer depends on repeated calls to
+   advance durations and event timing.
+
+2. The tempo field is measured in SCL_Update calls per line. The BPM field
+   stored by BEGIN_SONG is informational only.
+
+3. Note volume and envelope velocity are separate controls. Volume sets
+   the initial loudness; velocity changes the envelope decay speed.
+
+4. Gate shortens the sounding portion of an event. It does not change the
+   position of the next event in the track.
+
+5. Channel 3 has fewer volume levels than the pulse and noise channels.
+   Values from 0-15 are converted to the nearest hardware-supported wave
+   level.
+
+6. Channel 4 ignores pitched note periods and uses the instrument's NR43
+   noise configuration. Drum instruments are normally used on channel 4.
+
+7. Channel 1 is the only channel that uses the sweep register. The sweep
+   field in other instruments has no useful hardware effect.
+
+8. A pattern advances when its conductor track reaches END_TRACK, not
+   necessarily when the pattern's informational line_count is exhausted.
+
+9. Every pattern should list its intended tracks explicitly. Channels not
+   listed in a pattern are silenced when the pattern is loaded.
+
+10. Direct PLAY_* macros wait synchronously. Do not use them in a section
+    that must remain responsive unless blocking is intended.
+
+11. SCL writes Game Boy APU registers directly. Code that also manipulates
+    NR10-NR52 should coordinate ownership with the library.
+
+12. SCL_ENABLE_INTERRUPTS and SCL_DISABLE_INTERRUPTS alter the global IE
+    register and CPU interrupt state. Use them only when appropriate for
+    the rest of the program.
+
+13. The library stores channel arrays with a two-byte stride. Do not index
+    these arrays as densely packed one-byte arrays.
+
+14. SCL_Random is a 16-bit Galois LFSR generator. It updates
+    wSCL_RandomSeed and can be used by custom sound or gameplay code.
+
+
+======================================================================
+15. QUICK REFERENCE
+======================================================================
+
+Initialization and playback:
+
+    SCL_INIT
+    call SCL_PlaySong       ; HL = song
+    call SCL_Update          ; once per frame
+
+Composition:
+
+    BEGIN_SONG name, tempo, bpm
+    ADD_PATTERN pattern
+    END_SONG
+
+    BEGIN_PATTERN name, length
+    ADD_TRACK channel, track
+    END_PATTERN
+
+    BEGIN_TRACK name
+    NOTE note, duration, instrument[, volume[, gate[, velocity]]]
+    REST duration
+    SET_TEMPO tempo
+    END_TRACK
+
+Assets:
+
+    DEF_WAVEFORM name[, 16 bytes]
+    DEF_WAVEFORM_SAWTOOTH name
+    DEF_WAVEFORM_SQUARE name
+    DEF_INSTRUMENT name, duty, envelope, sweep, length[, effect, param, noise, wave]
+
+Direct sound:
+
+    PLAY_NOTE_CH1 period, duration
+    PLAY_NOTE_CH2 period, duration
+    PLAY_NOTE_CH3 period, duration
+    PLAY_NOISE noise, duration, envelope
+    PLAY_NOISE_DRUM name, duration
+
+Runtime controls:
+
+    SCL_SET_MASTER_VOLUME left, right
+    SCL_SET_MASTER_PAN nr51_value
+    SCL_SET_CHANNEL_VOLUME channel, volume
+    SCL_SET_CPU_PRIORITY priority
+    SCL_ENABLE_INTERRUPTS
+    SCL_DISABLE_INTERRUPTS
+    SCL_LOAD_WAVEFORM waveform
+
+Debugging and utility:
+
+    call SCL_GetActiveVoices
+    call SCL_Random
+    call SCL_StopChannel
+    call SCL_CopyWaveform
+    call SCL_WaitFrame
+    call SCL_WaitTicks
+
+======================================================================
+END OF MANUAL
+======================================================================
